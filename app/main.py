@@ -1,106 +1,79 @@
-from __future__ import annotations
+from fastapi import FastAPI, HTTPException, Depends
+from pydantic import BaseModel
+from sqlalchemy.orm import Session
+from sqlalchemy import func
+from typing import List
+import time
 
-from collections import defaultdict, deque
-from datetime import datetime, timezone
-from pathlib import Path
-from typing import Literal
+# Importamos nuestra configuración de base de datos y el modelo
+from .db import SessionLocal, engine, Base
+from .models import Telemetry
 
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import HTMLResponse
-from pydantic import BaseModel, Field
+# Creamos las tablas en Neon si no existen
+Base.metadata.create_all(bind=engine)
 
-app = FastAPI(
-    title="ACI606 Cloud Fleet Challenge",
-    version="0.1.0-starter",
-    description="Starter API for the ACI606 Cloud Fleet Challenge.",
-)
+app = FastAPI(title="ACI606 - Cloud Fleet Challenge")
 
-Status = Literal["NORMAL", "WARNING", "CRITICAL"]
+# Dependencia para obtener la sesión de la base de datos
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
 
-
-class Telemetry(BaseModel):
-    robot_id: str = Field(min_length=1, max_length=20)
+# --- MODELOS PYDANTIC (Contratos de entrada y salida) ---
+class TelemetryIn(BaseModel):
+    robot_id: str
     timestamp: float
     x: float
     y: float
-    speed: float = Field(ge=0)
-    battery: float = Field(ge=0, le=100)
+    speed: float
+    battery: float
     motor_temp: float
-    vibration: float = Field(ge=0)
-    motor_current: float = Field(ge=0)
-    obstacle_distance: float = Field(ge=0)
+    vibration: float
+    motor_current: float
+    obstacle_distance: float
 
-
-class PredictionRequest(Telemetry):
-    pass
-
-
-# Starter storage: intentionally volatile.
-# Students must replace this with persistent storage for the final challenge.
-LATEST: dict[str, Telemetry] = {}
-HISTORY: dict[str, deque[Telemetry]] = defaultdict(lambda: deque(maxlen=100))
-REQUEST_COUNT = 0
-
+# --- ENDPOINTS ---
 
 @app.get("/health")
-def health() -> dict:
-    return {
-        "status": "ok",
-        "service": "aci606-cloud-fleet",
-        "version": app.version,
-        "robots_in_memory": len(LATEST),
-        "utc": datetime.now(timezone.utc).isoformat(),
-    }
-
+def health():
+    return {"status": "ok", "service": "running"}
 
 @app.post("/telemetry")
-def ingest_telemetry(sample: Telemetry) -> dict:
-    global REQUEST_COUNT
-    REQUEST_COUNT += 1
-    LATEST[sample.robot_id] = sample
-    HISTORY[sample.robot_id].append(sample)
-    return {
-        "accepted": True,
-        "robot_id": sample.robot_id,
-        "server_time": datetime.now(timezone.utc).isoformat(),
-        "note": "Starter mode: data is stored only in RAM.",
-    }
-
+def post_telemetry(payload: TelemetryIn, db: Session = Depends(get_db)):
+    # Guardamos en PostgreSQL
+    new_record = Telemetry(**payload.model_dump())
+    db.add(new_record)
+    db.commit()
+    db.refresh(new_record)
+    return {"status": "ok", "id": new_record.id}
 
 @app.get("/robots")
-def list_robots() -> list[dict]:
-    return [sample.model_dump() for sample in LATEST.values()]
+def get_robots(db: Session = Depends(get_db)):
+    # Obtiene la última telemetría de cada robot
+    subquery = db.query(
+        Telemetry.robot_id, 
+        func.max(Telemetry.timestamp).label("max_ts")
+    ).group_by(Telemetry.robot_id).subquery()
 
+    results = db.query(Telemetry).join(
+        subquery,
+        (Telemetry.robot_id == subquery.c.robot_id) & 
+        (Telemetry.timestamp == subquery.c.max_ts)
+    ).all()
+    
+    return results
 
 @app.get("/robots/{robot_id}/history")
-def robot_history(robot_id: str) -> list[dict]:
-    if robot_id not in HISTORY:
-        raise HTTPException(status_code=404, detail="Robot not found")
-    return [sample.model_dump() for sample in HISTORY[robot_id]]
-
-
-@app.post("/predict")
-def predict(_: PredictionRequest) -> dict:
-    # TODO E4: load the trained model and return a real prediction.
-    # Required contract is documented in README.md and the student guide.
-    raise HTTPException(
-        status_code=501,
-        detail="/predict is part of the challenge. Train and integrate your model.",
-    )
-
-
-@app.get("/metrics")
-def metrics() -> dict:
-    # TODO E4: extend with latency, errors, throughput and model metrics.
-    return {
-        "requests_received": REQUEST_COUNT,
-        "robots_in_memory": len(LATEST),
-        "persistence": "RAM_ONLY",
-        "prediction_service": "NOT_IMPLEMENTED",
-    }
-
-
-@app.get("/dashboard", response_class=HTMLResponse)
-def dashboard() -> str:
-    path = Path(__file__).resolve().parents[1] / "dashboard" / "index.html"
-    return path.read_text(encoding="utf-8")
+def get_history(robot_id: str, db: Session = Depends(get_db)):
+    # Retorna todo el historial de un robot específico
+    results = db.query(Telemetry).filter(
+        Telemetry.robot_id == robot_id
+    ).order_by(Telemetry.timestamp.asc()).all()
+    
+    if not results:
+        raise HTTPException(status_code=404, detail="Robot no encontrado")
+        
+    return results
