@@ -1,4 +1,5 @@
-from fastapi import FastAPI, HTTPException, Depends
+from fastapi import FastAPI, HTTPException, Depends, Request
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 from sqlalchemy import func
@@ -7,13 +8,12 @@ import joblib
 import pandas as pd
 from pathlib import Path
 
-# Importamos nuestra configuración de base de datos y el modelo
 from .db import SessionLocal, engine, Base
 from .models import Telemetry
 
-# Creamos las tablas en Neon si no existen
 Base.metadata.create_all(bind=engine)
 
+# 1. CREAMOS LA APP (Esto debe ir antes de cualquier @app.get)
 app = FastAPI(title="ACI606 - Cloud Fleet Challenge")
 
 # --- CARGAR EL MODELO ML ---
@@ -21,17 +21,30 @@ MODEL_PATH = Path("models/model.joblib")
 if not MODEL_PATH.exists():
     raise RuntimeError("Modelo no encontrado. Ejecuta python ml/train_model.py")
 
-# Se carga una sola vez al iniciar el servidor
 model = joblib.load(MODEL_PATH)
 MODEL_VERSION = "v1"
 
-# Las mismas features con las que entrenaste el modelo
 FEATURES = [
     "speed", "battery", "motor_temp", 
     "vibration", "motor_current", "obstacle_distance"
 ]
 
-# Dependencia para obtener la sesión de la base de datos
+# --- MÉTRICAS (Observabilidad) ---
+METRICS = {
+    "telemetry_requests": 0,
+    "prediction_requests": 0,
+    "errors": 0,
+    "total_inference_ms": 0.0,
+}
+START_TIME = time.time()
+
+@app.middleware("http")
+async def count_requests(request: Request, call_next):
+    response = await call_next(request)
+    if response.status_code >= 400:
+        METRICS["errors"] += 1
+    return response
+
 def get_db():
     db = SessionLocal()
     try:
@@ -72,6 +85,7 @@ def health():
 
 @app.post("/telemetry")
 def post_telemetry(payload: TelemetryIn, db: Session = Depends(get_db)):
+    METRICS["telemetry_requests"] += 1
     new_record = Telemetry(**payload.model_dump())
     db.add(new_record)
     db.commit()
@@ -103,26 +117,21 @@ def get_history(robot_id: str, db: Session = Depends(get_db)):
 
 @app.post("/predict")
 def predict(payload: PredictIn):
+    METRICS["prediction_requests"] += 1
     start_time = time.perf_counter()
     
-    # 1. Extraer solo las features que el modelo necesita
     input_data = {k: getattr(payload, k) for k in FEATURES}
-    
-    # 2. Convertir a DataFrame (el modelo fue entrenado con pandas)
     X = pd.DataFrame([input_data])
     
-    # 3. Predecir
     prediction = model.predict(X)[0]
-    
-    # 4. Obtener la confianza (probabilidad de la clase predicha)
     probabilities = model.predict_proba(X)[0]
     confidence = float(max(probabilities))
     
-    # 5. Calcular tiempo de inferencia
     end_time = time.perf_counter()
     inference_ms = round((end_time - start_time) * 1000, 2)
     
-    # 6. Retornar el contrato exacto
+    METRICS["total_inference_ms"] += inference_ms
+    
     return {
         "robot_id": payload.robot_id,
         "predicted_status": str(prediction),
@@ -130,3 +139,26 @@ def predict(payload: PredictIn):
         "model_version": MODEL_VERSION,
         "inference_ms": inference_ms
     }
+
+@app.get("/metrics")
+def get_metrics():
+    uptime_seconds = time.time() - START_TIME
+    avg_latency = 0.0
+    if METRICS["prediction_requests"] > 0:
+        avg_latency = METRICS["total_inference_ms"] / METRICS["prediction_requests"]
+        
+    return {
+        "telemetry_requests": METRICS["telemetry_requests"],
+        "prediction_requests": METRICS["prediction_requests"],
+        "errors": METRICS["errors"],
+        "avg_prediction_latency_ms": round(avg_latency, 2),
+        "uptime_seconds": round(uptime_seconds, 2)
+    }
+
+# --- DASHBOARD (Ruta corregida, al final del archivo) ---
+@app.get("/dashboard", response_class=HTMLResponse)
+def get_dashboard():
+    dashboard_path = Path("dashboard/index.html")
+    if dashboard_path.exists():
+        return dashboard_path.read_text(encoding="utf-8")
+    return "<h1>Dashboard no encontrado</h1>"
